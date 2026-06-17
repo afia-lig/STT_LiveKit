@@ -15,6 +15,7 @@ from typing import Literal
 import numpy as np
 import sys
 import os
+import asyncio
 
 # Ensure NVIDIA CUDA DLLs are added to the DLL search path on Windows
 if sys.platform == "win32":
@@ -69,7 +70,7 @@ class FasterWhisperSTT(stt.STT):
         compute_type: ComputeType = "float16",
         language: str = "en",
         beam_size: int = 5,
-        vad_filter: bool = True,
+        vad_filter: bool = False,
         local_files_only: bool = True,
     ) -> None:
         super().__init__(
@@ -113,18 +114,21 @@ class FasterWhisperSTT(stt.STT):
 
         frames = buffer if isinstance(buffer, list) else [buffer]
         resampled_frames = []
+        resampler = None
         for frame in frames:
             if frame.sample_rate != target_sample_rate or frame.num_channels != target_channels:
-                resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate,
-                    output_rate=target_sample_rate,
-                    num_channels=target_channels,
-                    quality=rtc.AudioResamplerQuality.HIGH,
-                )
+                if resampler is None:
+                    resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate,
+                        output_rate=target_sample_rate,
+                        num_channels=target_channels,
+                        quality=rtc.AudioResamplerQuality.HIGH,
+                    )
                 resampled_frames.extend(resampler.push(frame))
-                resampled_frames.extend(resampler.flush())
             else:
                 resampled_frames.append(frame)
+        if resampler is not None:
+            resampled_frames.extend(resampler.flush())
 
         # Convert resampled frames to numpy array
         all_data = []
@@ -140,17 +144,24 @@ class FasterWhisperSTT(stt.STT):
         # Use provided language or fall back to configured default
         lang = language if language is not NOT_GIVEN else self._language
 
-        # Run transcription with optimized settings
+        # Run transcription with optimized settings offloaded to a worker thread
+        # to avoid blocking the single-threaded asyncio event loop.
         start_time = time.perf_counter()
-        segments, info = self._model.transcribe(
-            audio_data,
-            beam_size=self._beam_size,
-            best_of=self._beam_size,
-            temperature=0.0,  # Greedy decoding for consistency
-            vad_filter=self._vad_filter,
-            language=lang,
-        )
+        
+        def run_inference():
+            segments_generator, info = self._model.transcribe(
+                audio_data,
+                beam_size=self._beam_size,
+                best_of=self._beam_size,
+                temperature=0.0,  # Greedy decoding for consistency
+                vad_filter=self._vad_filter,
+                language=lang,
+            )
+            # Evaluate the generator inside the thread to do the heavy computation
+            return list(segments_generator), info
 
+        segments, info = await asyncio.to_thread(run_inference)
+        
         # Combine all segments into final text
         text = "".join(segment.text for segment in segments).strip()
         elapsed_ms = (time.perf_counter() - start_time) * 1000
