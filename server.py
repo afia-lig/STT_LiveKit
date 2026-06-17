@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 
@@ -5,37 +6,36 @@ from dotenv import load_dotenv
 from livekit.agents import AgentServer, AutoSubscribe, JobContext, JobProcess, cli
 from livekit.plugins import silero
 
-from transcriber.agent import SessionManager
+from transcriber.agent import SessionManager, FasterWhisperSTT
 from transcriber.db import create_pool, ensure_schema, upsert_meeting
 
 load_dotenv()
 
 logger = logging.getLogger("transcriber.server")
 
-server = AgentServer()
+server = AgentServer(
+    num_idle_processes=1,
+    initialize_process_timeout=60.0,
+)
+
+# Global lock to serialize database pool initialization across concurrent room connections in the same process
+db_init_lock = asyncio.Lock()
 
 
 @server.rtc_session(agent_name="transcriber")
 async def entrypoint(ctx: JobContext):
-    """
-    Called once per LiveKit room the agent is dispatched into.
-
-    Flow:
-    1. Get/Create the DB pool inside entrypoint (on the correct event loop)
-    2. Register this room as a meeting in the DB
-    3. Start the session manager (watches for participants)
-    4. Connect to the room (audio only — no video needed)
-    5. Handle anyone already in the room before we joined
-    6. Register cleanup to run when the room closes
-    """
+    # Cache DB pool in proc.userdata so that it is reused across meetings in the same process.
     db_pool = ctx.proc.userdata.get("db_pool")
     if db_pool is None:
-        db_pool = await create_pool()
-        await ensure_schema(db_pool)
-        ctx.proc.userdata["db_pool"] = db_pool
+        async with db_init_lock:
+            # Double-check inside lock to prevent race conditions
+            db_pool = ctx.proc.userdata.get("db_pool")
+            if db_pool is None:
+                db_pool = await create_pool()
+                await ensure_schema(db_pool)
+                ctx.proc.userdata["db_pool"] = db_pool
 
-    meeting_id = ctx.room.name  # LiveKit room name = our meeting ID
-
+    meeting_id = ctx.room.name
     await upsert_meeting(db_pool, meeting_id)
     logger.info(f"Transcription started for meeting: {meeting_id}")
 
@@ -46,10 +46,8 @@ async def entrypoint(ctx: JobContext):
     )
     session_manager.start()
 
-    # AUDIO_ONLY — we don't need video, saves bandwidth
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Handle participants already in the room when agent joins
     for participant in ctx.room.remote_participants.values():
         session_manager.on_participant_connected(participant)
 
@@ -57,18 +55,39 @@ async def entrypoint(ctx: JobContext):
 
 
 def prewarm(proc: JobProcess):
-    """
-    Runs once when a worker process starts up — before any rooms are joined.
-    Good place to load heavy resources so they're ready instantly.
-
-    We load:
-    - VAD (voice activity detection): detects when someone starts/stops speaking
-    """
+    # Load VAD and STT here to avoid event loop issues and speed up session startup
     logger.info("Prewarming worker...")
-
-    # Silero VAD — lightweight ML model that detects speech vs silence
     proc.userdata["vad"] = silero.VAD.load()
 
+    model_size = os.getenv("WHISPER_MODEL_SIZE", "base")
+    device = os.getenv("WHISPER_DEVICE", "cuda")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+    local_files_only = os.getenv("WHISPER_LOCAL_FILES_ONLY", "true").lower() == "true"
+
+    logger.info(f"Initializing local FasterWhisperSTT (model={model_size}, device={device}, compute_type={compute_type}, local_files_only={local_files_only})...")
+    try:
+        stt = FasterWhisperSTT(
+            model_size=model_size,
+            device=device,
+            compute_type=compute_type,
+            local_files_only=local_files_only,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to initialize FasterWhisperSTT on {device} ({e}). Falling back to CPU/int8...")
+        stt = FasterWhisperSTT(
+            model_size=model_size,
+            device="cpu",
+            compute_type="int8",
+            local_files_only=local_files_only,
+        )
+        device = "cpu"
+        compute_type = "int8"
+
+    logger.info(
+        f"Whisper loaded successfully: "
+        f"{model_size=} {device=} {compute_type=}"
+    )
+    proc.userdata["stt"] = stt
     logger.info("Worker ready.")
 
 
