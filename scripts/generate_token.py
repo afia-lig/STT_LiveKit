@@ -6,7 +6,7 @@ load_dotenv()
 
 ROOM_NAME = "test-meeting-1"
 
-users = ["Afia", "John", "Sarah", "Mike"]
+users = ["Anna", "John", "Sarah", "Mike","Sean"]
 
 for user in users:
     token = (

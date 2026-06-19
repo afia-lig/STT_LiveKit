@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -380,6 +380,63 @@ class SessionManager:
         except Exception:
             logger.exception(
                 "Failed to close session "
+                "for participant=%s",
+                participant_identity,
+            )
+
+        #
+        # Retrieve any transcript segments that were skipped (e.g. during shutdown
+        # when scheduling is paused but the final speech is committed).
+        #
+        try:
+            for msg in session.history.messages():
+                if msg.role != "user":
+                    continue
+
+                text = msg.text_content
+                if not text:
+                    continue
+
+                started_speaking_at = msg.metrics.get("started_speaking_at")
+                stopped_speaking_at = msg.metrics.get("stopped_speaking_at")
+
+                if started_speaking_at is not None:
+                    started_at = datetime.fromtimestamp(started_speaking_at, timezone.utc)
+                elif stopped_speaking_at is not None:
+                    started_at = datetime.fromtimestamp(stopped_speaking_at, timezone.utc)
+                else:
+                    started_at = datetime.fromtimestamp(msg.created_at, timezone.utc)
+
+                if stopped_speaking_at is not None:
+                    ended_at = datetime.fromtimestamp(stopped_speaking_at, timezone.utc)
+                else:
+                    ended_at = started_at
+
+                # Check if we already added this segment to avoid duplicates
+                # Match by text, participant, and start time
+                started_iso = started_at.isoformat()
+                already_added = any(
+                    s["participant"] == participant_identity and
+                    s["started_at"] == started_iso and
+                    s["text"] == text
+                    for s in self.transcript_segments
+                )
+                if not already_added:
+                    logger.info(
+                        "Rescued skipped transcript segment on session close: [%s] %s -> %s",
+                        started_at.strftime("%H:%M:%S"),
+                        participant_identity,
+                        text,
+                    )
+                    self.add_segment(
+                        participant=participant_identity,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        text=text,
+                    )
+        except Exception:
+            logger.exception(
+                "Failed to rescue skipped transcripts "
                 "for participant=%s",
                 participant_identity,
             )
